@@ -1,4 +1,12 @@
 @echo off
+setlocal EnableExtensions EnableDelayedExpansion
+rem File encoding is GBK(936): Chinese text parses reliably only when the
+rem console codepage is 936. Switch there unless it already is, and restore
+rem the original codepage on exit. Keep these lines ASCII-only.
+set "PREV_CHCP="
+for /f "tokens=2 delims=:" %%c in ('chcp') do set "PREV_CHCP=%%c"
+set "PREV_CHCP=%PREV_CHCP: =%"
+if not "%PREV_CHCP%"=="936" chcp 936 >nul
 rem 本文件为 GBK(936) 编码，请勿另存为 UTF-8，否则中文提示会乱码
 rem DSH Desktop Windows 一键打包脚本
 rem 双击运行：选择正式包或开发包，自动检查环境并打包，完成后打开产物目录。
@@ -132,6 +140,7 @@ start "" explorer /select,"%CD%\%PKG_INSTALLER%"
 echo.
 echo 按任意键关闭窗口...
 pause >nul
+if defined PREV_CHCP if not "%PREV_CHCP%"=="936" chcp %PREV_CHCP% >nul 2>nul
 endlocal
 exit /b 0
 
@@ -139,5 +148,6 @@ exit /b 0
 echo.
 echo 打包未完成。按任意键关闭窗口...
 pause >nul
+if defined PREV_CHCP if not "%PREV_CHCP%"=="936" chcp %PREV_CHCP% >nul 2>nul
 endlocal
 exit /b 1
