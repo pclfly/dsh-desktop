@@ -14,6 +14,25 @@ describe('Safe Mode', () => {
     expect(shouldStartInSafeMode(['DSH Desktop', '--safe-mode=false'])).toBe(false)
   })
 
+  it('shows static references as informational findings without blocking or selecting a repair', () => {
+    const model = buildSafeModeViewModel({
+      locale: 'zh', plugins: ['dsh-dream-skin'], issues: [{
+        id: 'static:legacy', kind: 'unverified-module-reference', severity: 'warning',
+        packageName: 'dsh-dream-skin', source: 'lib/client.js',
+        detail: 'Legacy compatibility fallback', resolution: 'inspect-only',
+        target: 'dsh-dream-skin', groupId: 'plugin:dsh-dream-skin',
+        groupName: 'dsh-dream-skin', groupKind: 'plugin'
+      }]
+    })
+    expect(model.restartConfirm).toBeUndefined()
+    expect(model.pluginItems[0]?.incompatible).toBe(false)
+    expect(model.issueGroups[0]).toMatchObject({
+      name: 'dsh-dream-skin', severityLabel: '警告', issueIds: [],
+      actionLabel: '仅提示；运行正常时无需处理'
+    })
+    expect(model.issueGroups[0]?.issues[0]?.kindLabel).toBe('兼容性待确认')
+  })
+
   it('explains isolation and presents plugin leftovers in one cleanup plan', () => {
     const model = buildSafeModeViewModel({
       locale: 'zh',
@@ -265,7 +284,9 @@ describe('Safe Mode', () => {
     expect(html).toContain("model.noticeTone === 'success'")
     expect(html).toContain("default-src 'none'")
     expect(html).not.toContain('http://')
-    expect(html).not.toContain('https://')
+    // Community links may open externally; the recovery UI still loads entirely offline.
+    expect(html).not.toMatch(/(?:src|srcset)=["']https?:/)
+    expect(html).toContain("img-src 'self' file:")
   })
 
   it('wires Safe Mode into startup, IPC, and the packaged resources', async () => {
@@ -302,9 +323,9 @@ describe('Safe Mode', () => {
     expect(main).toContain("ipcMain.handle('safe-mode:manage'")
     expect(main).toContain("ipcMain.handle('safe-mode:exit', async")
     expect(main).toContain("return { ok: false, blocked: true }")
-    expect(main).toContain('safeModeManagerWindow')
+    expect(main).toContain('safeModeManager')
     expect(main).toContain('safeModeSuspectedPlugins = [...new Set(detection.plugins)]')
-    expect(main).toContain('modal: true')
+    expect(main).toContain('new SafeModeOverlay(parent,')
     expect(main).toContain('assertTrustedSafeModeManagerEvent(event)')
     expect(main).toContain('`处理完成：修复 ${repaired} 项，卸载 ${selectedPlugins.length} 个插件。`')
     expect(main).toContain("label: isChinese ? '以安全模式重启…' : 'Restart as Safe Mode…'")
@@ -354,13 +375,14 @@ describe('Safe Mode', () => {
     const model = buildSafeModeViewModel({
       locale: 'zh',
       plugins: ['plugin-a', 'plugin-b'],
+      suspectedPlugins: ['plugin-a'],
       healthReports: [
         {
           packageName: 'plugin-a',
           installedVersion: '1.0.0',
           latestVersion: '2.0.0',
-          healthStatus: 'incompatible-fixed-in-latest',
-          healthLabel: '不兼容（最新版 v2.0.0 已适配）',
+          healthStatus: 'incompatible-upgrade-available',
+          healthLabel: '未找到兼容更新，可尝试 latest v2.0.0（兼容性未确认）',
           upgradeReady: true,
           upgradeVersion: '2.0.0'
         },
@@ -375,9 +397,10 @@ describe('Safe Mode', () => {
       ]
     })
     expect(model.upgradeReadyCount).toBe(1)
-    expect(model.upgradeAllLabel).toBe('一键升级 1 个已适配插件')
+    expect(model.upgradeAllLabel).toBe('一键升级 1 个有更新的插件')
     const itemA = model.pluginItems.find((p) => p.name === 'plugin-a')
     expect(itemA?.upgradeReady).toBe(true)
+    expect(itemA?.statusLabel).toContain('兼容性未确认')
     expect(itemA?.upgradeVersion).toBe('2.0.0')
     expect(itemA?.upgradeButtonLabel).toBe('升级至 v2.0.0')
     const itemB = model.pluginItems.find((p) => p.name === 'plugin-b')

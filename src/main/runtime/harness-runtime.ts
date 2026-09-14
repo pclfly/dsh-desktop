@@ -1,16 +1,20 @@
-import { execFileSync, type SpawnOptionsWithoutStdio } from 'node:child_process'
+import { execFile, execFileSync, type SpawnOptionsWithoutStdio } from 'node:child_process'
 import type { EventEmitter } from 'node:events'
 import { createWriteStream, existsSync, mkdirSync, type WriteStream } from 'node:fs'
 import { mkdir } from 'node:fs/promises'
 import { createServer } from 'node:net'
 import { dirname, join } from 'node:path'
+import { StringDecoder } from 'node:string_decoder'
 import type { RuntimePhase, RuntimeSnapshot } from '../../shared/contracts'
+import { SAFE_MODE_PROFILE } from '../state/safe-mode-profile'
+import { parsePluginStartupFailures, type PluginStartupFailure } from '../../shared/plugin-startup-failure'
 
 export interface HarnessRuntimeOptions {
   dshEntryPath: string
   nodeExecutablePath: string
   nodeEntryPath: string
   dshPatchPath: string
+  dshSafePatchPath: string
   dshHome: string
   logPath: string
   launchProcess(
@@ -18,6 +22,7 @@ export interface HarnessRuntimeOptions {
     args: string[],
     options: SpawnOptionsWithoutStdio
   ): HarnessChildProcess
+  preferredPort?: number
   startupTimeoutMs?: number
   onChanged(snapshot: RuntimeSnapshot): void
 }
@@ -28,6 +33,8 @@ export interface HarnessChildProcess extends EventEmitter {
   readonly exitCode: number | null
   kill(signal?: NodeJS.Signals): boolean
 }
+
+export const DEFAULT_HARNESS_PORT = 43129
 
 /**
  * Resolve the user's interactive login shell environment.
@@ -52,64 +59,109 @@ export interface HarnessChildProcess extends EventEmitter {
  */
 let resolvedShellEnvironment: NodeJS.ProcessEnv | undefined
 
-export function resolveShellEnvironment(): NodeJS.ProcessEnv {
-  if (resolvedShellEnvironment !== undefined) return resolvedShellEnvironment
+interface ShellCapture {
+  file: string
+  args: string[]
+  timeout: number
+  parse(output: string): NodeJS.ProcessEnv
+}
 
-  try {
-    if (process.platform === 'win32') {
+function shellCapture(): ShellCapture {
+  if (process.platform === 'win32') {
+    return {
       // PowerShell with the user profile loaded captures both registry
       // environment variables and any PATH additions sourced in $PROFILE
       // (e.g. conda activate, nvm use, scoop shim).  -OutputFormat Text
       // avoids BOM/XML wrapping.
-      const output = execFileSync(
-        'powershell',
-        [
-          '-NoLogo',
-          '-NonInteractive',
-          '-OutputFormat', 'Text',
-          '-Command',
-          // Windows PowerShell writes stdout in the console codepage, not
-          // UTF-8, and we decode as UTF-8 below. On a CJK install (ACP 936)
-          // every non-ASCII byte then arrives as U+FFFD, so a user profile
-          // directory like C:\Users\数据项素 comes back as eight replacement
-          // characters — and TEMP, captured here and passed to Harness
-          // unchanged, points nowhere. Harness dies in mkdtemp before it can
-          // load a plugin tree. Pinning the output encoding is what makes the
-          // decode below true; dropping undecodable values is the belt to its
-          // braces.
-          '[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; ' +
-          // Dot-source the profile (suppress errors if it doesn't exist),
-          // then emit NAME=VALUE for every environment variable.
-          '. $PROFILE 2>$null; Get-ChildItem Env: | ForEach-Object { "$($_.Name)=$($_.Value)" }'
-        ],
-        {
-          encoding: 'utf8',
-          timeout: 15_000,
-          stdio: ['ignore', 'pipe', 'ignore']
-        }
-      )
-      resolvedShellEnvironment = withoutUndecodableValues(
-        parseEnvOutput(output, /\r?\n/),
-        process.env
-      )
-    } else {
-      // macOS / Linux: run a login + interactive shell so both .zprofile
-      // (Homebrew, OrbStack) and .zshrc (mise shims, ~/.local/bin, cargo,
-      // go, etc.) are sourced.  stderr is ignored to suppress prompt noise.
-      const shell = process.env.SHELL ?? '/bin/sh'
-      const output = execFileSync(shell, ['-l', '-i', '-c', 'env'], {
-        encoding: 'utf8',
-        timeout: 10_000,
-        stdio: ['ignore', 'pipe', 'ignore']
-      })
-      resolvedShellEnvironment = parseEnvOutput(output, /\n/)
+      file: 'powershell',
+      args: [
+        '-NoLogo',
+        '-NonInteractive',
+        '-OutputFormat', 'Text',
+        '-Command',
+        // Windows PowerShell writes stdout in the console codepage, not
+        // UTF-8, and we decode as UTF-8 below. On a CJK install (ACP 936)
+        // every non-ASCII byte then arrives as U+FFFD, so a user profile
+        // directory like C:\Users\数据项素 comes back as eight replacement
+        // characters — and TEMP, captured here and passed to Harness
+        // unchanged, points nowhere. Harness dies in mkdtemp before it can
+        // load a plugin tree. Pinning the output encoding is what makes the
+        // decode below true; dropping undecodable values is the belt to its
+        // braces.
+        '[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; ' +
+        // Dot-source the profile (suppress errors if it doesn't exist),
+        // then emit NAME=VALUE for every environment variable.
+        '. $PROFILE 2>$null; Get-ChildItem Env: | ForEach-Object { "$($_.Name)=$($_.Value)" }'
+      ],
+      timeout: 15_000,
+      parse: (output) => withoutUndecodableValues(parseEnvOutput(output, /\r?\n/), process.env)
     }
+  }
+  return {
+    // macOS / Linux: run a login + interactive shell so both .zprofile
+    // (Homebrew, OrbStack) and .zshrc (mise shims, ~/.local/bin, cargo,
+    // go, etc.) are sourced.  stderr is ignored to suppress prompt noise.
+    file: process.env.SHELL ?? '/bin/sh',
+    args: ['-l', '-i', '-c', 'env'],
+    timeout: 10_000,
+    parse: (output) => parseEnvOutput(output, /\n/)
+  }
+}
+
+export function resolveShellEnvironment(): NodeJS.ProcessEnv {
+  if (resolvedShellEnvironment !== undefined) return resolvedShellEnvironment
+
+  try {
+    const capture = shellCapture()
+    const output = execFileSync(capture.file, capture.args, {
+      encoding: 'utf8',
+      timeout: capture.timeout,
+      stdio: ['ignore', 'pipe', 'ignore']
+    })
+    resolvedShellEnvironment = capture.parse(output)
   } catch {
     // Shell capture failed — stay silent and keep the inherited environment.
     resolvedShellEnvironment = process.env
   }
 
   return resolvedShellEnvironment
+}
+
+let shellEnvironmentCapture: Promise<NodeJS.ProcessEnv> | undefined
+
+/**
+ * Capture the shell environment off the main thread, memoised with
+ * {@link resolveShellEnvironment}.
+ *
+ * Running a login + interactive shell costs 300–450ms on a typical macOS
+ * setup. Captured synchronously at spawn time, that blocked the main process
+ * on the launch critical path; started when the app starts, it overlaps
+ * Electron's own boot and the splash, and the launch just reads the result.
+ */
+export function prewarmShellEnvironment(): Promise<NodeJS.ProcessEnv> {
+  if (resolvedShellEnvironment !== undefined) return Promise.resolve(resolvedShellEnvironment)
+  shellEnvironmentCapture ??= new Promise<NodeJS.ProcessEnv>((resolve) => {
+    let capture: ShellCapture
+    try {
+      capture = shellCapture()
+    } catch {
+      resolvedShellEnvironment = process.env
+      resolve(resolvedShellEnvironment)
+      return
+    }
+    execFile(
+      capture.file,
+      capture.args,
+      { encoding: 'utf8', timeout: capture.timeout, maxBuffer: 16 * 1024 * 1024 },
+      (error, stdout) => {
+        // A capture the synchronous path already finished wins; otherwise keep
+        // the inherited environment on failure, exactly like that path.
+        resolvedShellEnvironment ??= error ? process.env : capture.parse(stdout)
+        resolve(resolvedShellEnvironment)
+      }
+    ).stdin?.end()
+  })
+  return shellEnvironmentCapture
 }
 
 /**
@@ -325,7 +377,15 @@ export class HarnessRuntime {
   private launchDirectory?: string
   private url?: string
   private launchToken?: string
+  /**
+   * Wall clock for the current launch. Every log line carries `+<ms>` from it,
+   * so a slow start can be attributed to a phase instead of guessed at: the
+   * file otherwise timestamps only the `starting` line.
+   */
+  private launchClock?: number
   private readonly logLines: string[] = []
+  private pluginFailures: PluginStartupFailure[] = []
+  private logDecoders = { stdout: new StringDecoder('utf8'), stderr: new StringDecoder('utf8') }
   private readonly logRemainders: Record<'stdout' | 'stderr', string> = {
     stdout: '',
     stderr: ''
@@ -340,14 +400,21 @@ export class HarnessRuntime {
       launchDirectory: this.launchDirectory,
       url: this.url,
       authToken: this.launchToken,
+      pluginFailures: structuredClone(this.pluginFailures),
       logs: [...this.logLines]
     }
   }
 
+  private launchAttempts = 0
+  get launchAttemptId(): number { return this.launchAttempts }
+
   async start(launchDirectory: string, profile = 'web'): Promise<void> {
     await this.stop()
+    this.launchAttempts++
     this.logRemainders.stdout = ''
     this.logRemainders.stderr = ''
+    this.pluginFailures = []
+    this.logDecoders = { stdout: new StringDecoder('utf8'), stderr: new StringDecoder('utf8') }
     this.launchDirectory = launchDirectory
     this.url = undefined
     this.launchToken = undefined
@@ -364,8 +431,13 @@ export class HarnessRuntime {
       this.setState('failed', `Harness diagnostic entry was not found: ${this.options.nodeEntryPath}`)
       return
     }
-    if (!existsSync(this.options.dshPatchPath)) {
-      this.setState('failed', `DSH Desktop patch was not found: ${this.options.dshPatchPath}`)
+    // Profile isolation alone is insufficient: --patch is applied afterwards.
+    // Never reintroduce optional product plugins into the recovery profile.
+    const patchPath = profile === SAFE_MODE_PROFILE
+      ? this.options.dshSafePatchPath
+      : this.options.dshPatchPath
+    if (!existsSync(patchPath)) {
+      this.setState('failed', `DSH Desktop patch was not found: ${patchPath}`)
       return
     }
 
@@ -373,24 +445,33 @@ export class HarnessRuntime {
     await mkdir(dirname(this.options.logPath), { recursive: true })
     this.logStream ??= createWriteStream(this.options.logPath, { flags: 'a' })
 
-    const port = await reservePort()
+    const preferredPort = this.options.preferredPort ?? DEFAULT_HARNESS_PORT
+    const { port, usedPreferredPort } = await reserveLoopbackPort(preferredPort)
     const url = `http://127.0.0.1:${port}`
     const args = buildNodeArguments(
       this.options.nodeEntryPath,
       this.options.dshEntryPath,
       port,
-      this.options.dshPatchPath,
+      patchPath,
       profile
     )
     const startupTimeoutMs =
       this.options.startupTimeoutMs ?? (process.platform === 'win32' ? 120_000 : 45_000)
 
-    this.writeLog(`\n[desktop] starting ${new Date().toISOString()}`)
+    this.launchClock ??= Date.now()
+    this.writeLog(`[desktop] starting ${new Date().toISOString()}`)
     this.writeLog(`[desktop] launch directory ${launchDirectory}`)
     this.writeLog(`[desktop] profile ${profile}`)
+    this.writeLog(`[desktop] patch ${patchPath}`)
+    if (!usedPreferredPort) {
+      this.writeLog(
+        `[desktop] preferred endpoint http://127.0.0.1:${preferredPort} is unavailable; using a temporary port`
+      )
+    }
     this.writeLog(`[desktop] endpoint ${url}`)
     this.setState('starting', 'Starting DeepSeek Harness…')
 
+    const shellEnvironment = await prewarmShellEnvironment()
     let child: HarnessChildProcess
     try {
       child = this.options.launchProcess(
@@ -400,7 +481,7 @@ export class HarnessRuntime {
           launchDirectory,
           this.options.dshHome,
           process.platform,
-          resolveShellEnvironment()
+          shellEnvironment
         )
       )
     } catch (error) {
@@ -411,8 +492,11 @@ export class HarnessRuntime {
     }
     this.child = child
 
-    child.stdout.on('data', (chunk: Buffer) => this.writeChunk('stdout', chunk))
+    child.stdout.on('data', (chunk: Buffer) => {
+      if (this.child === child) this.writeChunk('stdout', chunk)
+    })
     child.stderr.on('data', (chunk: Buffer) => {
+      if (this.child !== child) return
       this.writeChunk('stderr', chunk)
       if (this.child !== child || this.phase !== 'starting') return
 
@@ -459,7 +543,7 @@ ${cause}`
     const startedAt = Date.now()
     const progressTimer = setInterval(
       () => this.writeLog(`[desktop] waiting for Harness (${Math.round((Date.now() - startedAt) / 1000)}s)`),
-      10_000
+      5_000
     )
     const ready = await waitUntilReady(
       url,
@@ -479,6 +563,7 @@ ${cause}`
     }
 
     this.url = url
+    this.writeLog('[desktop] Harness is ready')
     this.setState('ready', 'Harness is ready.')
   }
 
@@ -519,18 +604,26 @@ ${cause}`
   }
 
   private writeChunk(source: 'stdout' | 'stderr', chunk: Buffer): void {
-    const lines = `${this.logRemainders[source]}${chunk.toString('utf8')}`.split(/\r?\n/)
+    const lines = `${this.logRemainders[source]}${this.logDecoders[source].write(chunk)}`.split(/\r?\n/)
     this.logRemainders[source] = lines.pop() ?? ''
     for (const line of lines) {
       if (line.length === 0) continue
+      if (source === 'stderr' && this.phase === 'starting') {
+        const failures = parsePluginStartupFailures(line)
+        if (failures) this.pluginFailures.push(...failures)
+      }
       this.writeLog(`[${source}] ${line}`)
+      const hadToken = this.launchToken !== undefined
       this.launchToken ??= extractLaunchToken(line)
+      if (!hadToken && this.launchToken !== undefined) {
+        this.writeLog('[desktop] Harness announced its endpoint; probing until it answers')
+      }
     }
   }
 
   private flushLogRemainders(): void {
     for (const source of ['stdout', 'stderr'] as const) {
-      const line = this.logRemainders[source]
+      const line = this.logRemainders[source] + this.logDecoders[source].end()
       this.logRemainders[source] = ''
       if (line.length > 0) this.writeLog(`[${source}] ${line}`)
     }
@@ -541,6 +634,17 @@ ${cause}`
    * launch: what happens to the profile between launches is exactly what
    * someone reading the log after a failed install needs to see.
    */
+  /**
+   * Start this launch's clock before any pre-flight work runs. Profile
+   * maintenance — migration recovery, the pnpm store, generation projection,
+   * LaunchAgent audit — happens before `start()`, so a clock that began at
+   * `starting` hid all of it and made the launch look faster than it felt.
+   */
+  beginLaunch(reason: string): void {
+    this.launchClock = Date.now()
+    this.note(`\n[desktop] launch requested (${reason})`)
+  }
+
   note(line: string): void {
     if (!this.logStream) {
       try {
@@ -556,7 +660,26 @@ ${cause}`
   private writeLog(line: string): void {
     this.logLines.push(line)
     if (this.logLines.length > 200) this.logLines.splice(0, this.logLines.length - 200)
-    this.logStream?.write(`${line}\n`)
+    this.logStream?.write(`${this.stampLog(line)}\n`)
+  }
+
+  /**
+   * Prefix a log line with milliseconds since this launch began. Only the file
+   * copy is stamped: `logLines` feeds recovery detection and failure-cause
+   * extraction, which match on the line text.
+   */
+  private stampLog(line: string): string {
+    if (this.launchClock === undefined) return line
+    const stamp = `+${String(Date.now() - this.launchClock).padStart(5)}ms `
+    return line.startsWith('\n') ? `\n${stamp}${line.slice(1)}` : `${stamp}${line}`
+  }
+
+  flushLog(): Promise<void> {
+    const stream = this.logStream
+    if (!stream || stream.destroyed || stream.writableEnded) return Promise.resolve()
+    return new Promise((resolve, reject) => {
+      stream.write('', error => error ? reject(error) : resolve())
+    })
   }
 
   private closeLog(): void {
@@ -770,12 +893,12 @@ export function formatExitCode(code: number): string {
   return `exit code ${code} (${hexadecimal})`
 }
 
-async function reservePort(): Promise<number> {
+async function reservePort(port: number): Promise<number> {
   return new Promise((resolve, reject) => {
     const server = createServer()
     server.unref()
     server.once('error', reject)
-    server.listen({ host: '127.0.0.1', port: 0 }, () => {
+    server.listen({ host: '127.0.0.1', port }, () => {
       const address = server.address()
       if (!address || typeof address === 'string') {
         server.close()
@@ -788,6 +911,21 @@ async function reservePort(): Promise<number> {
   })
 }
 
+/**
+ * Prefer a stable loopback origin so Chromium can reuse the Harness frontend
+ * cache across launches. A conflicting local process must not prevent Desktop
+ * from starting, so an ephemeral port remains the fallback.
+ */
+export async function reserveLoopbackPort(
+  preferredPort = DEFAULT_HARNESS_PORT
+): Promise<{ port: number; usedPreferredPort: boolean }> {
+  try {
+    return { port: await reservePort(preferredPort), usedPreferredPort: true }
+  } catch {
+    return { port: await reservePort(0), usedPreferredPort: false }
+  }
+}
+
 async function waitUntilReady(
   url: string,
   isAlive: () => boolean,
@@ -795,7 +933,12 @@ async function waitUntilReady(
   timeoutMs: number
 ): Promise<boolean> {
   const deadline = Date.now() + timeoutMs
-  const stabilityWindowMs = 500
+  // A probe only counts as healthy once Harness has printed its launch token,
+  // and Harness prints that line after its whole plugin tree has loaded and
+  // the web server is serving. The first healthy probe is therefore already
+  // the settled state; a 500ms sustain window on top of it was pure latency
+  // at the end of every launch.
+  const stabilityWindowMs = 0
   let readySince: number | undefined
   while (Date.now() < deadline && isAlive()) {
     try {

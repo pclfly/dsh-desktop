@@ -219,6 +219,13 @@ describe('LAN mobile page', () => {
     expect(desktop).toContain('--bg:#141416')
     expect(desktop).toContain('.qr{display:inline-flex;background:#fff')
     expect(desktop).toContain('Creating a global network link')
+    expect(desktop).toContain('Copied')
+    expect(desktop).not.toContain('Link copied')
+    expect(desktop).not.toContain('id="copyToast"')
+    expect(desktop).toContain('id="copyBtn" class="copy"')
+    expect(desktop).toContain('id="copyTip"')
+    expect(desktop).toContain('class="copy-icon"')
+    expect(desktop).toContain('async function copyUrl()')
     expect(desktop).toContain('Switching to WiFi connection mode')
     expect(desktop).toContain('class="mode-panel"')
     expect(desktop).toContain('class="tunnel-progress" aria-hidden="true"')
@@ -226,8 +233,12 @@ describe('LAN mobile page', () => {
     expect(desktop).toContain('id="tunnelProgressBar"')
     expect(desktop).toContain('</div></div><div class="url-row">')
     expect(desktop).toContain(
-      '.has-request .qr,.has-request .url-row,.has-request .expires{display:none}'
+      '.has-request .qr,.has-request .url-row,.has-request .expires,.has-request .fallback-link{display:none}'
     )
+    expect(desktop).toContain("Can't open? Try another link")
+    expect(desktop).toContain('id="fallbackLink" class="fallback-link hide"')
+    expect(desktop).toContain("fetch('/desktop/tunnel/fallback'")
+    expect(desktop).toContain('async function switchFallback()')
     expect(desktop).toContain("document.body.classList.toggle('has-request',!!pendingId)")
     expect(desktop).toContain('duration=enableTunnel?4500:800')
     expect(desktop).toContain('Math.min(99,(Date.now()-tunnelProgressStartedAt)/duration*100)')
@@ -239,7 +250,8 @@ describe('LAN mobile page', () => {
     expect(desktop).toContain('id="qrCode"><svg></svg></div>')
     expect(desktop).toContain("document.getElementById('qrCode').innerHTML=j.qrSvg")
     expect(desktop).not.toContain("document.getElementById('qrContainer').innerHTML=j.qrSvg")
-    expect(desktop).toContain('if(phoneConnected||modeSwitching||tunnelActive===enableTunnel)return')
+    expect(desktop).toContain('if(phoneConnected||modeSwitching)return')
+    expect(desktop).toContain('if(selectedTunnelTab===enableTunnel&&tunnelActive===enableTunnel)return')
     expect(desktop).toContain('await finishTunnelProgress(completed,progressDuration)')
     expect(desktop).toContain('Phone connected')
     expect(desktop).toContain('You can close this window now.')
@@ -247,7 +259,7 @@ describe('LAN mobile page', () => {
     expect(desktop).toContain("document.body.classList.toggle('phone-connected'")
     expect(desktop).toContain('function syncModeControls(connected)')
     expect(desktop).toContain(
-      'if(phoneConnected||modeSwitching||tunnelActive===enableTunnel)return'
+      'if(selectedTunnelTab===enableTunnel&&tunnelActive===enableTunnel)return'
     )
     expect(desktop).not.toContain('📶')
     expect(desktop).not.toContain('🌐')
@@ -430,6 +442,13 @@ describe('LAN mobile page', () => {
     expect(desktop).toContain('断开连接')
     expect(desktop).toContain('现在可以关闭此窗口。')
     expect(desktop).toContain('onclick="window.close()">完成</button>')
+    expect(desktop).toContain('已复制')
+    expect(desktop).not.toContain('链接已复制')
+    expect(desktop).toContain('扫码打不开？换一条线路')
+    expect(desktop).toContain('正在切换备用线路')
+    expect(desktop).toContain('id="copyBtn"')
+    expect(desktop).toContain('id="copyTip"')
+    expect(desktop).not.toContain('id="copyToast"')
     expect(phone).toContain('请在 DSH Desktop 中确认连接请求。')
     expect(phone).toContain('再次发起申请')
     expect(phone).toContain('暂时无法连接桌面端，请先启动 DSH Desktop。')
@@ -454,6 +473,189 @@ describe('LAN mobile page', () => {
       'onclick="switchMode(true)" disabled>Internet Connection Mode</button>'
     )
     expect(desktop).toContain('.mode-btn:disabled{cursor:not-allowed;opacity:.5}')
+    expect(desktop).toContain('id="fallbackLink" class="fallback-link hide"')
+  })
+
+  it('shows tunnel errors only on the internet tab', () => {
+    const wifi = renderDesktopPairingPage({
+      qrSvg: '<svg></svg>',
+      pairingUrl: 'http://192.168.1.2/pair?token=test',
+      expiresAt: Date.now() + 60_000,
+      locale: 'zh',
+      connected: false,
+      tunnelActive: false,
+      tunnelError: 'Unable to create an internet tunnel. Cloudflare: reset'
+    })
+    const internet = renderDesktopPairingPage({
+      qrSvg: '<svg></svg>',
+      pairingUrl: 'https://primary.trycloudflare.com/pair?token=test',
+      expiresAt: Date.now() + 60_000,
+      locale: 'zh',
+      connected: false,
+      tunnelActive: true,
+      tunnelProvider: 'cloudflare',
+      tunnelError: 'Unable to create an internet tunnel. Cloudflare: reset'
+    })
+    expect(wifi).toContain('id="tunnelError" class="tunnel-err"></div>')
+    expect(wifi).not.toContain('id="tunnelError" class="tunnel-err show"')
+    expect(wifi).toContain('selectedTunnelTab=false')
+    expect(internet).toContain(
+      'id="tunnelError" class="tunnel-err show">隧道建立失败：Unable to create an internet tunnel. Cloudflare: reset</div>'
+    )
+    expect(internet).toContain('selectedTunnelTab=true')
+  })
+
+  it('keeps the internet tab selected after a failed tunnel switch', async () => {
+    const desktop = renderDesktopPairingPage({
+      qrSvg: '<svg id="initial"></svg>',
+      pairingUrl: 'http://192.168.1.2/pair?token=test',
+      expiresAt: Date.now() + 60_000,
+      locale: 'zh',
+      connected: false
+    })
+    const script = /<script>([\s\S]*?)<\/script>/.exec(desktop)?.[1]
+    expect(script).toBeTruthy()
+
+    const classList = () => {
+      const values = new Set<string>()
+      return {
+        add: (...names: string[]) => names.forEach((name) => values.add(name)),
+        remove: (...names: string[]) => names.forEach((name) => values.delete(name)),
+        toggle: (name: string, force?: boolean) => {
+          const next = force ?? !values.has(name)
+          if (next) values.add(name)
+          else values.delete(name)
+          return next
+        },
+        contains: (name: string) => values.has(name)
+      }
+    }
+    const ids = [
+      'qrLoading',
+      'tunnelLoadingText',
+      'tunnelProgressValue',
+      'tunnelProgressBar',
+      'btnLan',
+      'btnTunnel',
+      'url',
+      'qrCode',
+      'modeHint',
+      'tunnelError',
+      'requestMode',
+      'address',
+      'request',
+      'connection',
+      'expires'
+    ]
+    const elements = Object.fromEntries(
+      ids.map((id) => [
+        id,
+        {
+          id,
+          classList: classList(),
+          disabled: false,
+          textContent: '',
+          innerHTML: '',
+          offsetWidth: 152,
+          style: { width: '' }
+        }
+      ])
+    )
+    const document = {
+      body: { classList: classList() },
+      getElementById: (id: string) => elements[id]
+    }
+    const fetch = async (input: string, init?: { body?: string }) => {
+      if (input === '/desktop/tunnel/toggle') {
+        const enable = init?.body ? (JSON.parse(init.body) as { enable?: boolean }).enable : true
+        if (enable) {
+          return {
+            ok: true,
+            json: async () => ({
+              ok: false,
+              error: 'Unable to create an internet tunnel. Cloudflare: reset'
+            })
+          }
+        }
+        return {
+          ok: true,
+          json: async () => ({
+            ok: true,
+            active: false,
+            pairingUrl: 'http://192.168.1.2/pair?token=test',
+            qrSvg: '<svg id="lan"></svg>'
+          })
+        }
+      }
+      if (input === '/desktop/pending') {
+        return { ok: true, json: async () => ({}) }
+      }
+      if (input === '/desktop/status') {
+        return { ok: true, json: async () => ({ connected: false }) }
+      }
+      throw new Error(`Unexpected request: ${input}`)
+    }
+    const run = new Function(
+      'document',
+      'fetch',
+      'navigator',
+      'setInterval',
+      'setTimeout',
+      'location',
+      'window',
+      `${script};return {switchMode,selectedTunnelTab:()=>selectedTunnelTab}`
+    )
+    const api = run(
+      document,
+      fetch,
+      { clipboard: { writeText: () => undefined } },
+      () => 0,
+      (callback: () => void) => {
+        callback()
+        return 0
+      },
+      { reload: () => undefined },
+      { close: () => undefined }
+    ) as { switchMode: (enabled: boolean) => Promise<void>; selectedTunnelTab: () => boolean }
+
+    await api.switchMode(true)
+    expect(api.selectedTunnelTab()).toBe(true)
+    expect(elements.btnTunnel?.classList.contains('active')).toBe(true)
+    expect(elements.btnLan?.classList.contains('active')).toBe(false)
+    expect(elements.tunnelError?.classList.contains('show')).toBe(true)
+    expect(elements.tunnelError?.textContent).toContain('隧道建立失败：')
+    expect(elements.tunnelError?.textContent).toContain('Unable to create an internet tunnel')
+    expect(elements.modeHint?.textContent).toContain('4G/5G')
+
+    await api.switchMode(false)
+    expect(api.selectedTunnelTab()).toBe(false)
+    expect(elements.btnLan?.classList.contains('active')).toBe(true)
+    expect(elements.tunnelError?.classList.contains('show')).toBe(false)
+    expect(elements.tunnelError?.textContent).toContain('Unable to create an internet tunnel')
+  })
+
+  it('shows the backup-link action only for an active Cloudflare tunnel', () => {
+    const cloudflare = renderDesktopPairingPage({
+      qrSvg: '<svg></svg>',
+      pairingUrl: 'https://primary.trycloudflare.com/pair?token=test',
+      expiresAt: Date.now() + 60_000,
+      locale: 'en',
+      connected: false,
+      tunnelActive: true,
+      tunnelProvider: 'cloudflare'
+    })
+    const pinggy = renderDesktopPairingPage({
+      qrSvg: '<svg></svg>',
+      pairingUrl: 'https://fallback.a.pinggy.link/pair?token=test',
+      expiresAt: Date.now() + 60_000,
+      locale: 'en',
+      connected: false,
+      tunnelActive: true,
+      tunnelProvider: 'pinggy'
+    })
+    expect(cloudflare).toContain('id="fallbackLink" class="fallback-link"')
+    expect(cloudflare).not.toContain('id="fallbackLink" class="fallback-link hide"')
+    expect(pinggy).toContain('id="fallbackLink" class="fallback-link hide"')
   })
 })
 describe('desktop pairing page QR expiry self-healing', () => {

@@ -10,6 +10,9 @@ const releaseAssets = [
   'dsh-desktop-windows-x64-setup.exe'
 ]
 
+/** The exact Harness build every `@deepseek-ai/dsh-*` production dep is pinned to. */
+const HARNESS_VERSION = '0.1.5-rc.2'
+
 describe('GitHub release contract', () => {
   it('keeps the package and lockfile versions aligned', async () => {
     const packageJson = JSON.parse(
@@ -59,11 +62,12 @@ describe('GitHub release contract', () => {
       'utf8'
     )
     const packageLock = JSON.parse(packageLockRaw) as {
-      packages: Record<string, { resolved?: string }>
+      packages: Record<string, { resolved?: string; integrity?: string }>
     }
 
-    // alpha.3 introduced these as transitive deps of shipped packages; they must
-    // resolve from the vendored tarballs, not registry.npmmirror.com.
+    // alpha.3 introduced these as transitive deps of shipped packages; they are
+    // explicit production deps so the lockfile pins them like the rest of the
+    // closure instead of letting a transitive range float.
     const promotedClosurePackages = [
       '@deepseek-ai/dsh-client-ui-schedule',
       '@deepseek-ai/dsh-deque',
@@ -73,18 +77,26 @@ describe('GitHub release contract', () => {
     ]
 
     for (const packageName of promotedClosurePackages) {
-      expect(packageJson.dependencies[packageName]).toMatch(
-        /^file:packages\/harness-0\.1\.2-rc\.1\/npm-dsh\/.+\.tgz$/
-      )
-      expect(packageLock.packages[`node_modules/${packageName}`]?.resolved).toMatch(
-        /^file:packages\/harness-0\.1\.2-rc\.1\/npm-dsh\//
-      )
+      expect(packageJson.dependencies[packageName]).toBe(HARNESS_VERSION)
     }
 
-    // No @deepseek-ai/dsh-* package may resolve from a remote registry URL.
-    expect(packageLockRaw).not.toMatch(
-      /"resolved":\s*"https?:\/\/[^"]*deepseek-ai[/-]dsh/
+    // Upstream publishes the official CI build to the registry, so every
+    // `@deepseek-ai/dsh-*` dep is pinned to one exact version and every
+    // resolution carries an integrity hash — `npm ci` stays reproducible
+    // without vendoring tarballs into the repository.
+    const harnessDeps = Object.entries(packageJson.dependencies).filter(
+      ([name]) => name.startsWith('@deepseek-ai/dsh')
     )
+    expect(harnessDeps.length).toBeGreaterThan(200)
+    for (const [name, range] of harnessDeps) {
+      expect(range, name).toBe(HARNESS_VERSION)
+      const entry = packageLock.packages[`node_modules/${name}`]
+      expect(entry?.resolved, name).toMatch(/^https?:\/\//)
+      expect(entry?.integrity, name).toMatch(/^sha\d+-/)
+    }
+
+    // The vendored-tarball layout is gone; nothing may resolve from it.
+    expect(packageLockRaw).not.toMatch(/file:packages\/harness-/)
   })
 
   it('does not promote optional Harness providers and test support into the desktop runtime', async () => {
@@ -188,6 +200,10 @@ describe('GitHub release contract', () => {
     expect(packageJson.build.extraResources).toContainEqual({
       from: 'build/dsh-desktop.patch.yml',
       to: 'dsh-desktop.patch.yml'
+    })
+    expect(packageJson.build.extraResources).toContainEqual({
+      from: 'build/dsh-desktop-safe.patch.yml',
+      to: 'dsh-desktop-safe.patch.yml'
     })
     expect(packageJson.build.nsis.artifactName).toBe(
       'dsh-desktop-windows-${arch}-setup.${ext}'
@@ -375,7 +391,11 @@ describe('GitHub release contract', () => {
     expect(workflow).toContain('runs-on: windows-2022')
     expect(workflow).toContain('npm run package:dev:win')
     expect(workflow).toContain('Smoke test packaged Windows Harness')
-    expect(workflow).toContain('$executable = $env:SMOKE_EXE')
+    expect(workflow).toContain('$sourceExecutable = Get-Item $env:SMOKE_EXE')
+    expect(workflow).toContain("$isolatedApp = Join-Path $env:RUNNER_TEMP")
+    expect(workflow).toContain('$executable = Join-Path $isolatedApp $sourceExecutable.Name')
+    expect(workflow).toContain('-WorkingDirectory $isolatedApp')
+    expect(workflow).toContain('Packaged koffi native binding failed.')
     expect(workflow).toContain("'dist-dev\\win-unpacked\\DSH Desktop Dev.exe'")
     expect(workflow).toContain('if (-not [string]::IsNullOrEmpty($log))')
     expect(workflow).toContain("dsh web: (http://127\\.0\\.0\\.1:\\d+/\\?token=[^\\s]+)")
@@ -456,20 +476,21 @@ describe('GitHub release contract', () => {
     )
   })
 
-  it('routes the published download through the official website', async () => {
+  it('routes stable downloads through the website and previews through GitHub', async () => {
     const readmes = await Promise.all(
-      ['README.md', 'README.zh.md'].map((file) =>
+      ['README.md', 'README.zh.md', 'README.ja.md', 'README.ru.md', 'README.es.md', 'README.pt.md'].map((file) =>
         readFile(path.join(projectRoot, file), 'utf8')
       )
     )
 
     for (const readme of readmes) {
-      expect(readme).toContain('https://www.dshdesktop.com/#download')
+      expect(readme).toMatch(/https:\/\/(?:www\.)?dshdesktop\.com\/(?:#download|zh\/)/)
       expect(readme).not.toContain('| Platform | Package | Download |')
       expect(readme).not.toContain('| 平台 | 安装包 | 下载 |')
       expect(readme).not.toContain('Coming soon')
       expect(readme).not.toContain('即将发布')
-      expect(readme).not.toContain('github.com/dataelement/dsh-desktop/releases')
+      expect(readme).toContain('https://github.com/dataelement/dsh-desktop/releases')
+      expect(readme).toContain('**Pre-release**')
       for (const asset of releaseAssets) {
         expect(readme).not.toContain(`releases/latest/download/${asset}`)
       }

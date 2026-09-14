@@ -9,9 +9,12 @@ import type { AddressInfo } from 'node:net'
 import { LanMobileBridge } from '../src/main/mobile/lan-mobile-bridge'
 import {
   CLOUDFLARED_ASSETS,
+  CLOUDFLARED_DOWNLOAD_ATTEMPTS,
   CLOUDFLARED_VERSION,
+  downloadCloudflaredWithRetry,
   ensureCloudflaredBinary,
   extractTryCloudflareUrl,
+  isRetryableDownloadError,
   resolveCurrentAssetSpec,
   sha256OfFile,
   terminateChildProcess
@@ -20,7 +23,14 @@ import {
   startTunnelWithFallback,
   type InternetTunnelInstance
 } from '../src/main/mobile/internet-tunnel'
-import { extractPinggyUrl } from '../src/main/mobile/pinggy-tunnel'
+import {
+  buildPinggySshArgs,
+  ensurePinggyIdentity,
+  extractPinggyUrl,
+  PINGGY_HOST,
+  PINGGY_USER,
+  pinggyIdentityPath
+} from '../src/main/mobile/pinggy-tunnel'
 
 const bridges: LanMobileBridge[] = []
 const harnessServers: ReturnType<typeof createServer>[] = []
@@ -132,6 +142,48 @@ describe('Pinggy Tunnel utilities', () => {
     expect(extractPinggyUrl('ssh -p 443 free.pinggy.io')).toBeNull()
   })
 
+  it('uses a fixed Pinggy user and dedicated identity instead of the local login name', () => {
+    const knownHostsPath = join('/tmp', 'dsh-cloudflared', 'pinggy-known-hosts')
+    const identityPath = join('/tmp', 'dsh-cloudflared', 'pinggy-id')
+    const args = buildPinggySshArgs({
+      port: 39871,
+      knownHostsPath,
+      identityPath
+    })
+    expect(PINGGY_USER).toBe('dsh')
+    expect(PINGGY_USER).not.toBe(process.env.USER)
+    expect(PINGGY_USER).not.toBe(process.env.USERNAME)
+    expect(args).toContain('-R')
+    expect(args).toContain('0:127.0.0.1:39871')
+    expect(args).toContain('-i')
+    expect(args).toContain(identityPath)
+    expect(args).toContain('IdentitiesOnly=yes')
+    expect(args).toContain('BatchMode=yes')
+    expect(args).toContain(`User=${PINGGY_USER}`)
+    expect(args.at(-1)).toBe(PINGGY_HOST)
+    expect(args.join(' ')).not.toContain('@')
+    expect(pinggyIdentityPath(knownHostsPath)).toBe(identityPath)
+  })
+
+  it('reuses an existing Pinggy identity and creates one when missing', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'dsh-pinggy-'))
+    const existing = join(dir, 'existing-id')
+    await writeFile(existing, 'key')
+    const created: string[] = []
+    expect(await ensurePinggyIdentity({ identityPath: existing })).toBe(existing)
+
+    const missing = join(dir, 'new-id')
+    await ensurePinggyIdentity({
+      identityPath: missing,
+      createIdentity: async (identityPath) => {
+        created.push(identityPath)
+        await writeFile(identityPath, 'generated')
+      }
+    })
+    expect(created).toEqual([missing])
+    expect(existsSync(missing)).toBe(true)
+  })
+
   it('uses Pinggy only after Cloudflare fails', async () => {
     const calls: string[] = []
     const pinggy = fakeTunnel('pinggy', 'https://fallback.a.pinggy.link')
@@ -233,16 +285,112 @@ describe('LanMobileBridge tunnel state and endpoints', () => {
     const toggleOffJson = await toggleOffRes.json()
     expect(toggleOffJson.active).toBe(false)
   })
+
+  it('starts Pinggy and stops Cloudflare when the user asks for a backup link', async () => {
+    const stopped: string[] = []
+    const bridge = new LanMobileBridge({
+      harnessUrl: () => 'http://127.0.0.1:3000',
+      port: 0,
+      createCloudflareTunnel: async () =>
+        fakeTunnel('cloudflare', 'https://primary.trycloudflare.com', () =>
+          stopped.push('cloudflare')
+        ),
+      createPinggyTunnel: async () => fakeTunnel('pinggy', 'https://fallback.a.pinggy.link')
+    })
+    bridges.push(bridge)
+    const snapshot = await bridge.start()
+    await bridge.toggleTunnel(true)
+    expect(bridge.snapshot().tunnelProvider).toBe('cloudflare')
+
+    const response = await fetch(`http://127.0.0.1:${snapshot.port}/desktop/tunnel/fallback`, {
+      method: 'POST'
+    })
+    expect(response.status).toBe(200)
+    const body = await response.json()
+    expect(body.ok).toBe(true)
+    expect(body.active).toBe(true)
+    expect(body.provider).toBe('pinggy')
+    expect(body.url).toBe('https://fallback.a.pinggy.link')
+    expect(body.pairingUrl).toContain('https://fallback.a.pinggy.link/pair?token=')
+    expect(stopped).toEqual(['cloudflare'])
+  })
+
+  it('keeps Cloudflare when the Pinggy backup link cannot start', async () => {
+    const stopped: string[] = []
+    const bridge = new LanMobileBridge({
+      harnessUrl: () => 'http://127.0.0.1:3000',
+      port: 0,
+      createCloudflareTunnel: async () =>
+        fakeTunnel('cloudflare', 'https://primary.trycloudflare.com', () =>
+          stopped.push('cloudflare')
+        ),
+      createPinggyTunnel: async () => {
+        throw new Error('OpenSSH missing')
+      }
+    })
+    bridges.push(bridge)
+    await bridge.start()
+    await bridge.toggleTunnel(true)
+
+    const snapshot = await bridge.fallbackToPinggy()
+    expect(snapshot.tunnelActive).toBe(true)
+    expect(snapshot.tunnelProvider).toBe('cloudflare')
+    expect(snapshot.tunnelUrl).toBe('https://primary.trycloudflare.com')
+    expect(snapshot.tunnelError).toBe('OpenSSH missing')
+    expect(stopped).toEqual([])
+  })
+
+  it('rejects backup-link fallback unless an unconnected Cloudflare tunnel is active', async () => {
+    const bridge = new LanMobileBridge({
+      harnessUrl: () => 'http://127.0.0.1:3000',
+      port: 0,
+      forceCloudflareFailure: true,
+      createPinggyTunnel: async () => fakeTunnel('pinggy', 'https://forced.a.pinggy.link')
+    })
+    bridges.push(bridge)
+    const snapshot = await bridge.start()
+
+    const lanRes = await fetch(`http://127.0.0.1:${snapshot.port}/desktop/tunnel/fallback`, {
+      method: 'POST'
+    })
+    expect(lanRes.status).toBe(400)
+
+    await bridge.toggleTunnel(true)
+    expect(bridge.snapshot().tunnelProvider).toBe('pinggy')
+    const pinggyRes = await fetch(`http://127.0.0.1:${snapshot.port}/desktop/tunnel/fallback`, {
+      method: 'POST'
+    })
+    expect(pinggyRes.status).toBe(400)
+
+    await bridge.toggleTunnel(false)
+    const reconnect = await fetch(`http://127.0.0.1:${snapshot.port}/reconnect`)
+    const pairingId = /let id="([^"]+)"/.exec(await reconnect.text())?.[1]
+    expect(pairingId).toBeTruthy()
+    await fetch(`http://127.0.0.1:${snapshot.port}/desktop/decide`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ id: pairingId, approved: true })
+    })
+    await fetch(`http://127.0.0.1:${snapshot.port}/pair/status?id=${pairingId}`)
+
+    const connectedRes = await fetch(`http://127.0.0.1:${snapshot.port}/desktop/tunnel/fallback`, {
+      method: 'POST'
+    })
+    expect(connectedRes.status).toBe(409)
+  })
 })
 function fakeTunnel(
   provider: InternetTunnelInstance['provider'],
-  url: string
+  url: string,
+  onStop?: () => void
 ): InternetTunnelInstance {
   return {
     provider,
     url,
     process: {} as InternetTunnelInstance['process'],
-    stop: async () => undefined
+    stop: async () => {
+      onStop?.()
+    }
   }
 }
 
@@ -334,6 +482,44 @@ describe('cloudflared download integrity', () => {
     } finally {
       spec.sha256 = originalSha
     }
+  })
+
+  it('retries retryable download resets then succeeds', async () => {
+    let attempts = 0
+    const dest = join(await mkdtemp(join(tmpdir(), 'dsh-dl-')), 'cloudflared')
+    await downloadCloudflaredWithRetry('https://example.com/cloudflared', dest, {
+      attempts: CLOUDFLARED_DOWNLOAD_ATTEMPTS,
+      sleep: async () => undefined,
+      download: async (_url, destination) => {
+        attempts += 1
+        if (attempts < 3) {
+          const error = Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' })
+          await writeFile(destination, `partial-${attempts}`)
+          throw error
+        }
+        await writeFile(destination, 'ok')
+      }
+    })
+    expect(attempts).toBe(3)
+    expect(existsSync(dest)).toBe(true)
+  })
+
+  it('does not retry non-reset download failures', async () => {
+    let attempts = 0
+    await expect(
+      downloadCloudflaredWithRetry('https://example.com/cloudflared', '/tmp/unused', {
+        sleep: async () => undefined,
+        download: async () => {
+          attempts += 1
+          throw new Error('Download failed with status 404')
+        }
+      })
+    ).rejects.toThrow(/status 404/)
+    expect(attempts).toBe(1)
+    expect(isRetryableDownloadError(Object.assign(new Error('reset'), { code: 'ECONNRESET' }))).toBe(
+      true
+    )
+    expect(isRetryableDownloadError(new Error('Download failed with status 404'))).toBe(false)
   })
 
   it('sweeps leftover .download-* files from interrupted runs', async () => {
